@@ -8,7 +8,9 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: starter
-    healthCheckPath: /
+    # Returns 503 if the data disk is unmounted or unwritable, so a bad
+    # deploy is caught instead of serving a broken app.
+    healthCheckPath: /api/health
     envVars:
       # Set these in the Render dashboard (marked sync:false so they are
       # never committed to the repo).
