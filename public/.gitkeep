@@ -1,0 +1,3 @@
+# Keeps public/ tracked by git even while it holds no static assets.
+# App icons live in app/ (icon.svg, apple-icon.svg) via the Next.js metadata
+# file convention, so nothing needs to be served from here yet.

@@ -18,6 +18,10 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
+# Ensure public/ exists even when the repo ships no static assets, so the
+# runner stage's COPY cannot fail.
+RUN mkdir -p /app/public
+
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
@@ -35,6 +39,11 @@ RUN addgroup --system --gid 1001 nodejs \
 
 # `output: "standalone"` bundles only what the server needs, so node_modules
 # is not copied. public/ and .next/static are not included automatically.
+#
+# public/ is currently empty (icons live in app/), and git does not track empty
+# directories, so it may be absent from the build context. The builder stage
+# guarantees it exists (see `mkdir -p /app/public` there) to keep this COPY
+# working whether or not the repo ships static assets.
 COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
