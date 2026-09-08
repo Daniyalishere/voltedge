@@ -134,7 +134,17 @@ function checkEmail(): Check {
       detail: "Gmail not configured - login codes fall back to the server console",
     };
   }
-  return { status: "pass", detail: `Gmail configured (${mailMode})` };
+
+  // SMTP is blocked on most Render plans, so flag it rather than reporting a
+  // clean pass that would hide the real cause of failed sends.
+  if (mailMode !== "gmail-api") {
+    return {
+      status: "warn",
+      detail: `Sending over SMTP (${mailMode}) - blocked on many hosts; unset MAIL_TRANSPORT to use the Gmail HTTP API`,
+    };
+  }
+
+  return { status: "pass", detail: "Gmail HTTP API (port 443)" };
 }
 
 function round(n: number): number {

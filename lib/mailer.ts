@@ -1,12 +1,23 @@
+import { google } from "googleapis";
 import nodemailer, { type Transporter } from "nodemailer";
 
 /**
- * Gmail delivery via Nodemailer, authenticated with Google OAuth2.
+ * Gmail delivery, authenticated with Google OAuth2.
  *
- * OAuth2 is Google's current, recommended mechanism. You supply a long-lived
- * **refresh token**; Nodemailer exchanges it for a short-lived access token
- * automatically before each send and renews it as needed, so nothing here has
- * to be rotated by hand.
+ * Two transports are supported, chosen automatically:
+ *
+ *   1. **Gmail HTTP API** (default) - sends over HTTPS on port 443.
+ *      Hosts such as Render block outbound SMTP ports (25, and usually 465
+ *      and 587 too), which makes Nodemailer's SMTP transport fail there with
+ *      a connection timeout. The REST API is not affected because 443 is
+ *      never blocked.
+ *
+ *   2. **SMTP via Nodemailer** - used when MAIL_TRANSPORT=smtp, or when only
+ *      an App Password is configured. Fine locally; expect it to hang on
+ *      Render.
+ *
+ * Both use the same long-lived **refresh token**; a short-lived access token
+ * is minted automatically and renewed as needed, so nothing is rotated by hand.
  *
  * Required env vars (see .env.example for how to obtain each):
  *   GMAIL_USER            the Gmail address that sends the mail
@@ -14,8 +25,9 @@ import nodemailer, { type Transporter } from "nodemailer";
  *   GOOGLE_CLIENT_SECRET  OAuth client secret (Google Cloud Console)
  *   GOOGLE_REFRESH_TOKEN  refresh token       (OAuth Playground)
  *
- * A 16-character App Password (GMAIL_APP_PASSWORD) is still honoured as a
- * fallback when no OAuth2 credentials are present.
+ * Optional:
+ *   MAIL_TRANSPORT=smtp   force the SMTP path instead of the HTTP API
+ *   GMAIL_APP_PASSWORD    App Password fallback when no OAuth2 vars are set
  *
  * If nothing is configured the app stays fully usable: mail is logged to the
  * console instead of sent, and login codes surface in the UI (see the route
@@ -25,19 +37,36 @@ const GMAIL_USER = process.env.GMAIL_USER?.trim();
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID?.trim();
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET?.trim();
 const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN?.trim();
-// Optional: only needed if you want to pin a pre-fetched access token.
-const ACCESS_TOKEN = process.env.GOOGLE_ACCESS_TOKEN?.trim();
 const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD?.replace(/\s+/g, "");
+const FORCE_SMTP = process.env.MAIL_TRANSPORT?.trim().toLowerCase() === "smtp";
 
 const oauthConfigured = Boolean(GMAIL_USER && CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN);
 const appPasswordConfigured = Boolean(GMAIL_USER && GMAIL_APP_PASSWORD);
 
 export const mailConfigured = oauthConfigured || appPasswordConfigured;
-export const mailMode = oauthConfigured
-  ? "oauth2"
-  : appPasswordConfigured
-    ? "app-password"
-    : "disabled";
+
+/** Which transport will actually be used, surfaced by /api/health. */
+export const mailMode: "gmail-api" | "smtp-oauth2" | "smtp-app-password" | "disabled" =
+  oauthConfigured && !FORCE_SMTP
+    ? "gmail-api"
+    : oauthConfigured
+      ? "smtp-oauth2"
+      : appPasswordConfigured
+        ? "smtp-app-password"
+        : "disabled";
+
+/* ------------------------------------------------------------------ */
+/* Transports                                                          */
+/* ------------------------------------------------------------------ */
+
+// The OAuth2 client caches and refreshes access tokens internally.
+const oauthClient = oauthConfigured
+  ? (() => {
+      const c = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, "https://developers.google.com/oauthplayground");
+      c.setCredentials({ refresh_token: REFRESH_TOKEN });
+      return c;
+    })()
+  : null;
 
 let transporter: Transporter | null = null;
 
@@ -54,8 +83,6 @@ function getTransporter(): Transporter | null {
             clientId: CLIENT_ID,
             clientSecret: CLIENT_SECRET,
             refreshToken: REFRESH_TOKEN,
-            // Nodemailer mints one from the refresh token when omitted.
-            ...(ACCESS_TOKEN ? { accessToken: ACCESS_TOKEN } : {}),
           },
         })
       : nodemailer.createTransport({
@@ -72,10 +99,84 @@ export interface MailResult {
   error?: string;
 }
 
-async function send(to: string, subject: string, html: string, text: string): Promise<MailResult> {
-  const tx = getTransporter();
+/**
+ * Builds an RFC 2822 message and base64url-encodes it for the Gmail API.
+ * Subjects are RFC 2047 encoded so non-ASCII characters survive.
+ */
+function buildRawMessage(to: string, subject: string, html: string, text: string): string {
+  const boundary = `voltedge_${Date.now().toString(36)}`;
+  const encodedSubject = `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
 
-  if (!tx) {
+  const message = [
+    `From: "VoltEdge Charging" <${GMAIL_USER}>`,
+    `To: ${to}`,
+    `Subject: ${encodedSubject}`,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/plain; charset=UTF-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    Buffer.from(text, "utf8").toString("base64"),
+    "",
+    `--${boundary}`,
+    "Content-Type: text/html; charset=UTF-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    Buffer.from(html, "utf8").toString("base64"),
+    "",
+    `--${boundary}--`,
+  ].join("\r\n");
+
+  // Gmail requires base64url (RFC 4648 §5), not standard base64.
+  return Buffer.from(message, "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/** Sends over HTTPS:443 via the Gmail REST API - works where SMTP is blocked. */
+async function sendViaApi(
+  to: string,
+  subject: string,
+  html: string,
+  text: string
+): Promise<MailResult> {
+  const gmail = google.gmail({ version: "v1", auth: oauthClient! });
+
+  await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw: buildRawMessage(to, subject, html, text) },
+  });
+
+  return { sent: true };
+}
+
+/** Sends over SMTP via Nodemailer - blocked on most Render plans. */
+async function sendViaSmtp(
+  to: string,
+  subject: string,
+  html: string,
+  text: string
+): Promise<MailResult> {
+  const tx = getTransporter();
+  if (!tx) return { sent: false, error: "Email is not configured on the server." };
+
+  await tx.sendMail({
+    from: `"VoltEdge Charging" <${GMAIL_USER}>`,
+    to,
+    subject,
+    text,
+    html,
+  });
+
+  return { sent: true };
+}
+
+async function send(to: string, subject: string, html: string, text: string): Promise<MailResult> {
+  if (!mailConfigured) {
     console.warn(
       `[mailer] Gmail not configured - email to ${to} was not sent.\n` +
         `         Subject: ${subject}\n` +
@@ -86,20 +187,15 @@ async function send(to: string, subject: string, html: string, text: string): Pr
   }
 
   try {
-    await tx.sendMail({
-      from: `"VoltEdge Charging" <${GMAIL_USER}>`,
-      to,
-      subject,
-      text,
-      html,
-    });
-    return { sent: true };
+    return mailMode === "gmail-api"
+      ? await sendViaApi(to, subject, html, text)
+      : await sendViaSmtp(to, subject, html, text);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
 
     // A revoked or expired refresh token is the most common OAuth2 failure and
     // the message Google returns ("invalid_grant") is not self-explanatory.
-    if (mailMode === "oauth2" && /invalid_grant|Token has been expired|unauthorized_client/i.test(message)) {
+    if (/invalid_grant|Token has been expired|unauthorized_client/i.test(message)) {
       console.error(
         `[mailer] Google rejected the refresh token: ${message}\n` +
           `         Generate a new GOOGLE_REFRESH_TOKEN - tokens are revoked when the\n` +
@@ -107,6 +203,26 @@ async function send(to: string, subject: string, html: string, text: string): Pr
           `         screen is still in "Testing" mode.`
       );
       return { sent: false, error: "Google rejected the mail credentials. The refresh token needs renewing." };
+    }
+
+    // A blocked SMTP port shows up as a timeout or refused connection, which
+    // is otherwise very hard to diagnose from the raw error.
+    if (/ETIMEDOUT|ECONNREFUSED|ESOCKET|Connection timeout|greeting never received/i.test(message)) {
+      console.error(
+        `[mailer] SMTP connection failed: ${message}\n` +
+          `         The host is very likely blocking outbound SMTP ports.\n` +
+          `         Remove MAIL_TRANSPORT=smtp to use the Gmail HTTP API (port 443) instead.`
+      );
+      return { sent: false, error: "Could not reach the mail server - SMTP appears to be blocked on this host." };
+    }
+
+    // The Gmail API rejects sends when the API itself is not enabled.
+    if (/accessNotConfigured|has not been used in project|Gmail API has not been/i.test(message)) {
+      console.error(
+        `[mailer] Gmail API is not enabled for this Google Cloud project.\n` +
+          `         Enable it at: APIs & Services > Library > Gmail API > Enable`
+      );
+      return { sent: false, error: "The Gmail API is not enabled for this Google Cloud project." };
     }
 
     console.error(`[mailer] Failed to send "${subject}" to ${to}:`, message);
